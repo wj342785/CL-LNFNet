@@ -1,0 +1,244 @@
+import torch
+import einops
+import torch.nn as nn
+from layers.LiNo import DataEmbedding_inverted,LiNo_Block
+from layers.RevIN import RevIN
+import torch.nn.functional as F
+from models.kan import KAN
+class Model(nn.Module):
+    def __init__(self, configs):
+        super(Model, self).__init__()
+        self.revin_layer=RevIN()
+        # Embedding
+        self.enc_embedding = DataEmbedding_inverted(configs.seq_len, configs.d_model,configs.dropout)
+        # LiNo Block
+        self.lino_blocks=nn.ModuleList([LiNo_Block(configs) for _ in range(configs.layers)])  
+        self.num=2*configs.layers
+        self.model2 = base_Model()
+        self.filter1 = Filter1(configs)
+        self.filter2 = Filter2(configs)
+
+    def forward(self, x_enc,ret_pred=None):
+        # [B, T, N]
+        x_enc=self.revin_layer(x_enc)
+        x_embed = self.enc_embedding(x_enc)
+
+        res=x_embed
+        pred_linears=[]
+        pred_non_linears=[]
+
+        for lino_block in self.lino_blocks:
+            pred_linear,pred_non_linear,res=lino_block(res)
+            pred_linears.append(pred_linear.transpose(1,2))
+            pred_non_linears.append(pred_non_linear.transpose(1,2))
+
+        pred_linears = sum(pred_linears)
+        pred_linears = self.filter1(pred_linears)
+
+        pred_non_linears = sum(pred_non_linears)
+        pred_non_linears = self.filter2(pred_non_linears)
+
+        pred = pred_linears + pred_non_linears
+        # print(pred.shape)
+        pred = self.revin_layer.reverse(pred)
+
+        logits, x1 = self.model2(pred)
+
+        return x1, logits
+
+class base_Model(nn.Module):
+    def __init__(self):
+        super(base_Model, self).__init__()
+
+        print("base Model is build!")
+
+        self.conv_block1 = nn.Sequential(
+            nn.Conv1d(96, 32, kernel_size=25,
+                      stride=1, bias=False, padding=4),
+            nn.BatchNorm1d(32),
+            nn.ELU(),
+            nn.MaxPool1d(kernel_size=3, stride=2, padding=1),
+            nn.Dropout(0.15)
+        )
+
+        self.conv_block2 = nn.Sequential(
+            nn.Conv1d(32, 128, kernel_size=8, stride=1, bias=False, padding=4),
+            nn.BatchNorm1d(128),
+            nn.ELU(),
+            nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
+        )
+
+        self.conv_block3 = nn.Sequential(
+            nn.Conv1d(128, 128, kernel_size=8, stride=1, bias=False, padding=4),
+            nn.BatchNorm1d(128),
+            nn.ELU(),
+            nn.MaxPool1d(kernel_size=3, stride=2, padding=1),
+        )
+
+        self.adaptive_pool = nn.AdaptiveAvgPool1d(32)
+        self.logits = nn.Linear(4096, 2)
+
+    def forward(self, x_in):
+        x = x_in
+        x = self.conv_block1(x)
+
+        x = self.conv_block2(x)
+
+        x1 = self.conv_block3(x)
+        x = self.adaptive_pool(x1)
+
+        x_flat = x.reshape(x.shape[0], -1)
+        logits = self.logits(x_flat)
+        return logits, x1
+
+class Filter1(nn.Module):
+
+    def __init__(self, configs):
+        super(Filter1, self).__init__()
+        self.seq_len = configs.seq_len
+        self.pred_len = 1000
+        self.embed_size = 128
+        self.hidden_size = 256
+        self.dropout = configs.dropout
+        self.band_width = 96
+        self.scale = 0.02
+        self.sparsity_threshold = 0.01
+
+        self.w = nn.Parameter(self.scale * torch.randn(2, self.embed_size))
+        self.w1 = nn.Parameter(self.scale * torch.randn(2, self.embed_size))
+
+        self.rb1 = nn.Parameter(self.scale * torch.randn(self.embed_size))
+        self.ib1 = nn.Parameter(self.scale * torch.randn(self.embed_size))
+
+        self.rb2 = nn.Parameter(self.scale * torch.randn(self.embed_size))
+        self.ib2 = nn.Parameter(self.scale * torch.randn(self.embed_size))
+
+        self.fc = nn.Sequential(
+            KAN([self.embed_size, 64, self.hidden_size]),
+            nn.LeakyReLU(),
+            KAN([self.hidden_size, 64, self.embed_size])
+        )
+
+        self.output = nn.Linear(self.embed_size, self.pred_len)
+
+        self.layernorm = nn.LayerNorm(self.embed_size)
+        self.layernorm1 = nn.LayerNorm(self.embed_size)
+        self.dropout = nn.Dropout(self.dropout)
+        self.model2 = base_Model()
+
+        self.w2 = nn.Parameter(self.scale * torch.randn(1, self.embed_size))
+
+    def texfilter(self, x):
+        B, N, _ = x.shape
+        o1_real = torch.zeros([B, N // 2 + 1, self.embed_size],
+                              device=x.device)
+        o1_imag = torch.zeros([B, N // 2 + 1, self.embed_size],
+                              device=x.device)
+
+        o2_real = torch.zeros([B, N // 2 + 1, self.embed_size],
+                              device=x.device)
+        o2_imag = torch.zeros([B, N // 2 + 1, self.embed_size],
+                              device=x.device)
+
+        o1_real = F.relu(
+            torch.einsum('bid,d->bid', x.real, self.w[0]) - \
+            torch.einsum('bid,d->bid', x.imag, self.w[1]) + \
+            self.rb1
+        )
+
+        o1_imag = F.relu(
+            torch.einsum('bid,d->bid', x.imag, self.w[0]) + \
+            torch.einsum('bid,d->bid', x.real, self.w[1]) + \
+            self.ib1
+        )
+
+        o2_real = (
+                torch.einsum('bid,d->bid', o1_real, self.w1[0]) - \
+                torch.einsum('bid,d->bid', o1_imag, self.w1[1]) + \
+                self.rb2
+        )
+
+        o2_imag = (
+                torch.einsum('bid,d->bid', o1_imag, self.w1[0]) + \
+                torch.einsum('bid,d->bid', o1_real, self.w1[1]) + \
+                self.ib2
+        )
+
+        y = torch.stack([o2_real, o2_imag], dim=-1)
+        y = F.softshrink(y, lambd=self.sparsity_threshold)
+        y = torch.view_as_complex(y)
+        return y
+
+    def forward(self, x):
+        # x: [Batch, Input length, Channel]
+        B, L, N = x.shape
+
+        Tx = torch.fft.rfft(x, dim=1, norm='ortho')
+
+        weight = self.texfilter(Tx)
+        Tx = Tx * weight
+        Tx = torch.fft.irfft(Tx, n=N, dim=1, norm="ortho")
+        Tx = self.layernorm1(Tx)
+        Tx = self.dropout(Tx)
+        Tx = self.fc(Tx)
+        Tx = self.output(Tx)
+
+        # Tx = Tx.permute(0, 2, 1)
+
+        return Tx
+
+
+class Filter2(nn.Module):
+
+    def __init__(self, configs):
+        super(Filter2, self).__init__()
+        self.seq_len = configs.seq_len
+        self.pred_len = 1000
+        self.embed_size = 128
+        self.hidden_size = 256
+        self.dropout = configs.dropout
+        self.band_width = 96
+        self.scale = 0.02
+        self.sparsity_threshold = 0.01
+
+        self.w = nn.Parameter(self.scale * torch.randn(2, self.embed_size))
+        self.w1 = nn.Parameter(self.scale * torch.randn(2, self.embed_size))
+
+        self.rb1 = nn.Parameter(self.scale * torch.randn(self.embed_size))
+        self.ib1 = nn.Parameter(self.scale * torch.randn(self.embed_size))
+
+        self.rb2 = nn.Parameter(self.scale * torch.randn(self.embed_size))
+        self.ib2 = nn.Parameter(self.scale * torch.randn(self.embed_size))
+
+        self.fc = nn.Sequential(
+            KAN([self.embed_size, 64, self.hidden_size]),
+            nn.LeakyReLU(),
+            KAN([self.hidden_size, 64, self.embed_size])
+        )
+
+        self.output = nn.Linear(self.embed_size, self.pred_len)
+
+        self.layernorm = nn.LayerNorm(self.embed_size)
+        self.layernorm1 = nn.LayerNorm(self.embed_size)
+        self.dropout = nn.Dropout(self.dropout)
+
+        self.w2 = nn.Parameter(self.scale * torch.randn(1, self.embed_size))
+
+    def circular_convolution(self, x, w):
+        x = torch.fft.rfft(x, dim=2, norm='ortho')
+        w = torch.fft.rfft(w, dim=1, norm='ortho')
+        y = x * w
+        out = torch.fft.irfft(y, n=self.embed_size, dim=2, norm="ortho")
+        return out
+
+    def forward(self, x):
+        # x: [Batch, Input length, Channel]
+        B, L, N = x.shape
+
+        Px = self.circular_convolution(x, self.w2.to(x.device))  # B, N, D
+        Px = self.fc(Px)
+        Px = self.output(Px)
+
+        # Px = Px.permute(0, 2, 1)
+
+        return Px
